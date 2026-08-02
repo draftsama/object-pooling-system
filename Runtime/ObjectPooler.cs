@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -16,12 +17,80 @@ namespace OPS
     }
 
     /// <summary>
+    /// Payload for <see cref="ObjectPooler.OnSpawn"/> and <see cref="ObjectPooler.OnDespawn"/>.
+    /// </summary>
+    public readonly struct PoolEventArgs
+    {
+        /// <summary>Name passed to Spawn/CreatePool, without the type prefix.</summary>
+        public readonly string PoolName;
+
+        /// <summary>Type-qualified internal key, e.g. "Bullet::enemy_bullets". Unique per pool.</summary>
+        public readonly string PoolKey;
+
+        /// <summary>The spawned/despawned instance.</summary>
+        public readonly GameObject GameObject;
+
+        public PoolEventArgs(string poolName, string poolKey, GameObject gameObject)
+        {
+            PoolName = poolName;
+            PoolKey = poolKey;
+            GameObject = gameObject;
+        }
+
+        public override string ToString() => $"{PoolKey} -> {(GameObject != null ? GameObject.name : "<destroyed>")}";
+    }
+
+    /// <summary>
     /// Singleton facade for the ObjectPooling system. Delegates all state and logic to PoolRegistry.
     /// </summary>
     public class ObjectPooler : MonoBehaviour
     {
         private static ObjectPooler instance;
         private PoolRegistry _registry;
+
+        // ========== Global spawn/despawn events ==========
+
+        /// <summary>
+        /// Raised after an object is taken from a pool and its <see cref="IPooledObject.OnSpawn"/> ran.
+        /// Static: subscribers MUST unsubscribe in OnDisable/OnDestroy or they leak across scenes.
+        /// </summary>
+        public static event Action<PoolEventArgs> OnSpawn;
+
+        /// <summary>
+        /// Raised when an object is returned to its pool, after <see cref="IPooledObject.OnDespawn"/>
+        /// and before the object is deactivated and its transform reset — so subscribers can still
+        /// read its final position/parent.
+        /// Not raised for objects destroyed via DestroyPooledObject, ClearPool or ClearAllPools.
+        /// </summary>
+        public static event Action<PoolEventArgs> OnDespawn;
+
+        internal static void RaiseSpawn(PoolEventArgs args)
+        {
+            var handler = OnSpawn;
+            if (handler == null) return;
+            try { handler(args); }
+            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.OnSpawn subscriber threw for {args}: {e}"); }
+        }
+
+        internal static void RaiseDespawn(PoolEventArgs args)
+        {
+            var handler = OnDespawn;
+            if (handler == null) return;
+            try { handler(args); }
+            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.OnDespawn subscriber threw for {args}: {e}"); }
+        }
+
+        /// <summary>
+        /// Clears static state so stale subscribers from a previous play session cannot survive
+        /// when Domain Reload is disabled (Enter Play Mode Options).
+        /// </summary>
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStatics()
+        {
+            OnSpawn = null;
+            OnDespawn = null;
+            instance = null;
+        }
 
         [Header("Pool Information")]
         [SerializeField] private List<PoolInfo> poolInfoList = new List<PoolInfo>();

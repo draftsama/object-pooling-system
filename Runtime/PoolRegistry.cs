@@ -84,10 +84,12 @@ namespace OPS
                     metadata.statistics.RecordGet(typedPool.CountActive);
                     obj.gameObject.SetActive(true);
                     (obj as IPooledObject)?.OnSpawn();
+                    ObjectPooler.RaiseSpawn(new PoolEventArgs(metadata.originalPoolName, poolKey, obj.gameObject));
                 },
                 actionOnRelease: obj =>
                 {
                     (obj as IPooledObject)?.OnDespawn();
+                    ObjectPooler.RaiseDespawn(new PoolEventArgs(metadata.originalPoolName, poolKey, obj.gameObject));
                     obj.gameObject.SetActive(false);
                     obj.transform.SetParent(poolParent);
                     obj.transform.localPosition = Vector3.zero;
@@ -128,10 +130,12 @@ namespace OPS
                     metadata.statistics.RecordGet(typedPool.CountActive);
                     obj.SetActive(true);
                     (obj.GetComponent<IPooledObject>())?.OnSpawn();
+                    ObjectPooler.RaiseSpawn(new PoolEventArgs(metadata.originalPoolName, poolKey, obj));
                 },
                 actionOnRelease: obj =>
                 {
                     (obj.GetComponent<IPooledObject>())?.OnDespawn();
+                    ObjectPooler.RaiseDespawn(new PoolEventArgs(metadata.originalPoolName, poolKey, obj));
                     obj.SetActive(false);
                     obj.transform.SetParent(poolParent);
                     obj.transform.localPosition = Vector3.zero;
