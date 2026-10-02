@@ -177,6 +177,21 @@ namespace OPS
         public static GameObject Spawn(string poolName, GameObject prefab, int defaultCapacity = 10, int maxSize = 100)
             => GetInstance()._registry.GetFromPoolGameObject(poolName, prefab, defaultCapacity, maxSize);
 
+        /// <summary>Spawn and parent under <paramref name="parent"/> (e.g. a Canvas) — required for UI prefabs.</summary>
+        public static T Spawn<T>(string poolName, T prefab, Transform parent, int defaultCapacity = 10, int maxSize = 100) where T : Component
+        {
+            T obj = Spawn(poolName, prefab, defaultCapacity, maxSize);
+            obj.transform.SetParent(parent, false);
+            return obj;
+        }
+
+        public static GameObject Spawn(string poolName, GameObject prefab, Transform parent, int defaultCapacity = 10, int maxSize = 100)
+        {
+            GameObject obj = Spawn(poolName, prefab, defaultCapacity, maxSize);
+            obj.transform.SetParent(parent, false);
+            return obj;
+        }
+
         public static void Release<T>(T obj) where T : Component
             => GetInstance()._registry.ReturnToPool(obj.gameObject);
 
