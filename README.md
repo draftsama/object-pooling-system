@@ -56,6 +56,18 @@ Static facade for all pool operations. The singleton GameObject is created autom
 
 Holds all pool state. Not used directly — `ObjectPooler` delegates to it.
 
+## Drop-in Components (`Runtime/Components`)
+
+Add these to a prefab; no code needed. Spawn the prefab through `ObjectPooler` as usual and it
+releases itself. Each one implements `IPooledObject`, so a prefab should carry only one of them
+(or combine with your own `IPooledObject` only for Component pools — GameObject pools call the
+first one found).
+
+| Component | Releases the object when |
+| --- | --- |
+| `PooledParticle` | the `ParticleSystem` and all its child systems have finished (looping systems never finish) |
+| `PooledReleaseDelay` | `Delay` seconds have passed since spawn (`_useUnscaledTime` ignores `Time.timeScale`) |
+
 ## Usage
 
 ### Basic Usage
