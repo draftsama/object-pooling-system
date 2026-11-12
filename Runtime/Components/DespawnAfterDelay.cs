@@ -3,7 +3,7 @@ using UnityEngine;
 namespace OPS
 {
     [DisallowMultipleComponent]
-    public class PooledReleaseDelay : MonoBehaviour, IPooledObject
+    public class DespawnAfterDelay : MonoBehaviour, IPooledObject
     {
         [SerializeField, Min(0f)] private float _delay = 1f;
         [SerializeField] private bool _useUnscaledTime;
@@ -36,7 +36,7 @@ namespace OPS
             if (_remaining > 0f) return;
 
             _isCounting = false;
-            ObjectPooler.Release(gameObject);
+            ObjectPooler.Despawn(gameObject);
         }
     }
 }

@@ -1,297 +1,27 @@
 # Object Pooling System
 
-A flexible and efficient object pooling system for Unity that helps optimize performance by reusing objects instead of constantly instantiating and destroying them. Built on top of `UnityEngine.Pool.ObjectPool<T>`.
+Reuse GameObjects instead of instantiating and destroying them. Everything lives in the `OPS`
+namespace and goes through the static `ObjectPooler` class. Terms used below are defined in
+[GLOSSARY.md](GLOSSARY.md).
 
-## Features
-
-- **Component & GameObject pools**: `Spawn<T>` for any `Component`, or plain `GameObject`
-- **Automatic pool creation**: pools are created on-demand with configurable capacity and max size
-- **Fluent builder API**: `CreatePool(...).WithCapacity(...).WithPrewarm(...).Prewarm()`
-- **IPooledObject interface**: optional spawn/despawn lifecycle callbacks per object
-- **Global events**: `OnSpawn` / `OnDespawn` static events reporting pool name and instance
-- **Statistics**: per-pool gets, releases, peak active count, lifetime
-- **Integrity checking**: periodic sweep for destroyed-but-tracked objects, with recovery
-- **Inspector view**: live pool info in the `ObjectPooler` GameObject (Editor only)
-- **DontDestroyOnLoad**: the pooler persists across scenes automatically
-
-Everything lives in the `OPS` namespace.
-
-### How to add submodule by command line
-
-```bash
-git submodule add  <url> <relative_path>
-```
-
-Example
+## Install as a submodule
 
 ```bash
 git submodule add git@github.com:draftsama/object-pooling-system.git Assets/object-pooling-system
 ```
 
-## Components
+## How it works
 
-### 1. IPooledObject Interface
-
-Optional interface for objects that need lifecycle callbacks:
-
-```csharp
-namespace OPS
-{
-    public interface IPooledObject
-    {
-        void OnSpawn();   // Called when retrieved from pool
-        void OnDespawn(); // Called when returned to pool
-    }
-}
-```
-
-For Component pools the interface is checked on the spawned component itself.
-For GameObject pools it is resolved with `GetComponent<IPooledObject>()`.
-
-### 2. ObjectPooler (Singleton)
-
-Static facade for all pool operations. The singleton GameObject is created automatically on first use.
-
-### 3. PoolRegistry
-
-Holds all pool state. Not used directly — `ObjectPooler` delegates to it.
-
-## Drop-in Components (`Runtime/Components`)
-
-Add these to a prefab; no code needed. Spawn the prefab through `ObjectPooler` as usual and it
-releases itself. Each one implements `IPooledObject`, so a prefab should carry only one of them
-(or combine with your own `IPooledObject` only for Component pools — GameObject pools call the
-first one found).
-
-| Component | Releases the object when |
-| --- | --- |
-| `PooledParticle` | the `ParticleSystem` and all its child systems have finished (looping systems never finish) |
-| `PooledReleaseDelay` | `Delay` seconds have passed since spawn (`_useUnscaledTime` ignores `Time.timeScale`) |
+- A **pool** is identified by its **name** only. The first `Spawn` or `Prewarm` with a name creates
+  the pool from the prefab you pass; later calls reuse it.
+- The first call creates a `DontDestroyOnLoad` GameObject named `ObjectPooler`. Each pool keeps its
+  inactive instances under an inactive `Pool_<name>` child of it, so pools survive scene loads.
+- A spawned instance is placed under the `parent` you pass, or at the root of the active scene, at
+  the prefab's local position, rotation and scale, **before** it is activated. Unparented active
+  instances are destroyed with their scene, like `Instantiate`d objects; the pool forgets them.
+- Works in Play mode only.
 
 ## Usage
-
-### Basic Usage
-
-```csharp
-using OPS;
-using UnityEngine;
-
-public class Example : MonoBehaviour
-{
-    [SerializeField] private MyComponent prefab;
-
-    void SpawnObject()
-    {
-        // Get object from pool (creates the pool if it doesn't exist)
-        MyComponent obj = ObjectPooler.Spawn("MyPool", prefab, defaultCapacity: 10, maxSize: 100);
-
-        obj.transform.position = Vector3.zero;
-
-        // Return to pool when done
-        ObjectPooler.Release(obj);
-    }
-}
-```
-
-GameObject prefabs work the same way:
-
-```csharp
-GameObject go = ObjectPooler.Spawn("Effects", effectPrefab);
-ObjectPooler.Release(go);
-```
-
-> Pools are keyed by **type + name**, so `Spawn("fx", bulletComponent)` and
-> `Spawn("fx", someGameObject)` are two different pools.
-
-### Fluent builder (prewarming)
-
-```csharp
-// Pre-populate 20 bullets, max 100, without getting one back
-ObjectPooler.CreatePool("BulletPool", bulletPrefab)
-            .WithCapacity(20)
-            .WithMaxSize(100)
-            .WithPrewarm(20)
-            .Prewarm();
-
-// Or prewarm and take one immediately
-Bullet first = ObjectPooler.CreatePool("BulletPool", bulletPrefab)
-                           .WithPrewarm(20)
-                           .BuildAndGet();
-```
-
-### With IPooledObject Interface
-
-```csharp
-using OPS;
-using UnityEngine;
-
-public class Bullet : MonoBehaviour, IPooledObject
-{
-    public void OnSpawn()
-    {
-        // Initialize when spawned
-        GetComponent<Rigidbody>().linearVelocity = transform.forward * 10f;
-    }
-
-    public void OnDespawn()
-    {
-        // Cleanup when despawned
-        GetComponent<Rigidbody>().linearVelocity = Vector3.zero;
-    }
-}
-```
-
-## Global Spawn / Despawn Events
-
-`ObjectPooler` raises two **static** events for every pooled instance, so systems that
-don't own the object (audio, VFX budgeting, analytics, debug overlays) can react without
-touching the prefab.
-
-```csharp
-public readonly struct PoolEventArgs
-{
-    public readonly string     PoolName;   // name passed to Spawn/CreatePool, e.g. "BulletPool"
-    public readonly string     PoolKey;    // type-qualified key, e.g. "Bullet::BulletPool"
-    public readonly GameObject GameObject; // the instance
-}
-
-public static event Action<PoolEventArgs> OnSpawn;
-public static event Action<PoolEventArgs> OnDespawn;
-```
-
-### Subscribing
-
-```csharp
-using OPS;
-using UnityEngine;
-
-public class SpawnMonitor : MonoBehaviour
-{
-    void OnEnable()
-    {
-        ObjectPooler.OnSpawn   += HandleSpawn;
-        ObjectPooler.OnDespawn += HandleDespawn;
-    }
-
-    void OnDisable()   // ALWAYS unsubscribe — the events are static
-    {
-        ObjectPooler.OnSpawn   -= HandleSpawn;
-        ObjectPooler.OnDespawn -= HandleDespawn;
-    }
-
-    void HandleSpawn(PoolEventArgs e)
-    {
-        if (e.PoolName != "BulletPool") return;   // events are global, filter yourself
-        Debug.Log($"spawned {e.GameObject.name} from {e.PoolName}");
-    }
-
-    void HandleDespawn(PoolEventArgs e)
-    {
-        // still safe to read the object's final position/parent here
-        Debug.Log($"despawned at {e.GameObject.transform.position}");
-    }
-}
-```
-
-### When they fire
-
-| Event | Timing |
-| --- | --- |
-| `OnSpawn` | after the object is activated **and** after `IPooledObject.OnSpawn()` — the instance is fully initialized |
-| `OnDespawn` | after `IPooledObject.OnDespawn()`, **before** `SetActive(false)` and before the transform is reset — final position/rotation/parent are still readable |
-
-### Rules and caveats
-
-- **Static events leak.** Subscribe in `OnEnable`, unsubscribe in `OnDisable`/`OnDestroy`.
-  A handler on a destroyed object keeps the whole object alive and will throw on invoke.
-- **Statics are reset on play.** `ResetStatics()` runs at `SubsystemRegistration`, so
-  subscribers from a previous play session cannot survive when *Enter Play Mode Options*
-  disables Domain Reload.
-- **Handler exceptions are swallowed** and logged through `PoolLogger.LogError` so one bad
-  subscriber cannot corrupt the pool's get/release cycle. Keep handlers cheap — they run
-  synchronously inside every spawn and release.
-- **Not raised on destruction.** `DestroyPooledObject`, `ClearPool` and `ClearAllPools`
-  destroy objects without a release, so no `OnDespawn` fires for them. `ReleaseAndClearPool`
-  does release first, so it does fire.
-- **Don't reparent inside `OnDespawn`.** The pool resets parent, position, rotation and
-  scale immediately after the event returns.
-
-## API Reference
-
-All methods are `static` on `OPS.ObjectPooler`.
-
-### Spawn / Release
-
-```csharp
-T          Spawn<T>(string poolName, T prefab, int defaultCapacity = 10, int maxSize = 100) where T : Component
-GameObject Spawn(string poolName, GameObject prefab, int defaultCapacity = 10, int maxSize = 100)
-
-void Release<T>(T obj) where T : Component
-void Release(GameObject obj)
-```
-
-`Spawn` creates the pool on first call. `Release` is a no-op for objects the pooler isn't tracking.
-
-### Builders
-
-```csharp
-PoolBuilder<T>         CreatePool<T>(string poolName, T prefab) where T : Component
-GameObjectPoolBuilder  CreatePool(string poolName, GameObject prefab)
-```
-
-Both builders expose `WithCapacity(int)`, `WithMaxSize(int)`, `WithPrewarm(int)`,
-then terminate with `Prewarm()` (no return) or `BuildAndGet()` (returns one instance).
-
-### Destroy
-
-```csharp
-void DestroyPooledObject<T>(T obj) where T : Component
-void DestroyPooledObject(GameObject obj)
-```
-
-Removes the object from tracking and destroys it. Use when an instance must not go back to the pool.
-
-### Release / Clear
-
-```csharp
-void ReleaseAllPool(string poolName)       // return every active object of that pool
-void ReleaseAndClearPool(string poolName)  // release all, then dispose the pool
-void ReleaseAllPools()                     // return every active object of every pool
-void ClearPool(string poolName)            // dispose the pool (does not release actives first)
-void ClearAllPools()                       // dispose everything
-```
-
-### Statistics & integrity
-
-```csharp
-PoolStatistics                        GetStatistics(string poolName)
-Dictionary<string, PoolStatistics>    GetAllStatistics()
-int                                   GetActiveObjectCount(string poolName)
-int                                   ValidatePoolIntegrity()   // returns issues fixed
-void                                  RecoverCorruptedPools()
-```
-
-`PoolStatistics` exposes `totalGets`, `totalReleases`, `peakActiveCount`,
-`currentActiveCount`, `creationTime`, `lastGetTime`, `lastReleaseTime`, `GetLifetime()`.
-
-An integrity sweep runs automatically every 10 seconds.
-
-### Logging
-
-```csharp
-PoolLogger.LogLevel = PoolLogLevel.None;   // None | Errors | Warnings | All (default: Warnings)
-```
-
-## Best Practices
-
-1. **Use consistent pool names** — declare them as `const string`.
-2. **Set appropriate capacities** — `defaultCapacity` near steady-state usage, `maxSize` as the hard ceiling.
-3. **Implement `IPooledObject`** for per-object reset; use the global events for cross-cutting systems.
-4. **Always release** — never `Destroy()` a pooled object directly; use `Release` or `DestroyPooledObject`.
-5. **Unsubscribe from the static events** in `OnDisable`.
-6. **Keep event handlers cheap** — they run on every spawn and release.
-
-## Example Scenario: Bullet System
 
 ```csharp
 using OPS;
@@ -299,104 +29,170 @@ using UnityEngine;
 
 public class Gun : MonoBehaviour
 {
-    [SerializeField] private Bullet bulletPrefab;
-    [SerializeField] private Transform firePoint;
-    private const string BULLET_POOL = "BulletPool";
+    private const string BulletPool = "Bullet";
 
-    void Start()
+    [SerializeField] private Bullet _bulletPrefab;
+    [SerializeField] private Transform _muzzle;
+
+    private void Start()
     {
-        ObjectPooler.CreatePool(BULLET_POOL, bulletPrefab)
-                    .WithCapacity(20)
-                    .WithMaxSize(100)
-                    .WithPrewarm(20)
-                    .Prewarm();
+        ObjectPooler.Prewarm(BulletPool, _bulletPrefab, count: 20, maxInactive: 100);
     }
 
-    void Fire()
+    private void Fire()
     {
-        Bullet bullet = ObjectPooler.Spawn(BULLET_POOL, bulletPrefab, 20, 100);
-        bullet.transform.SetPositionAndRotation(firePoint.position, firePoint.rotation);
+        Bullet bullet = ObjectPooler.Spawn(BulletPool, _bulletPrefab);
+        bullet.transform.SetPositionAndRotation(_muzzle.position, _muzzle.rotation);
     }
 }
 
 public class Bullet : MonoBehaviour, IPooledObject
 {
-    [SerializeField] private float lifetime = 3f;
-    private float spawnTime;
+    public void OnSpawn() { }
+    public void OnDespawn() { }
 
-    public void OnSpawn()
-    {
-        spawnTime = Time.time;
-        GetComponent<Rigidbody>().linearVelocity = transform.forward * 20f;
-    }
-
-    public void OnDespawn()
-    {
-        GetComponent<Rigidbody>().linearVelocity = Vector3.zero;
-    }
-
-    void Update()
-    {
-        if (Time.time - spawnTime >= lifetime)
-            ObjectPooler.Release(this);
-    }
-
-    void OnCollisionEnter(Collision collision)
-    {
-        ObjectPooler.Release(this);
-    }
-}
-
-// Spawn an impact VFX for every bullet despawn, without the Bullet knowing about VFX
-public class ImpactFx : MonoBehaviour
-{
-    [SerializeField] private GameObject impactPrefab;
-
-    void OnEnable()  => ObjectPooler.OnDespawn += HandleDespawn;
-    void OnDisable() => ObjectPooler.OnDespawn -= HandleDespawn;
-
-    void HandleDespawn(PoolEventArgs e)
-    {
-        if (e.PoolName != "BulletPool") return;
-        var fx = ObjectPooler.Spawn("ImpactFx", impactPrefab);
-        fx.transform.position = e.GameObject.transform.position;
-    }
+    private void OnCollisionEnter(Collision collision) => ObjectPooler.Despawn(this);
 }
 ```
 
-## Performance Benefits
+UI prefabs: pass the Canvas (or a child of it) as `parent`.
 
-- **Reduced GC Pressure**: Minimizes garbage collection by reusing objects
-- **Faster Spawning**: Object retrieval is faster than Instantiate
-- **Predictable Performance**: No allocation spikes during gameplay
-- **Memory Efficiency**: Controlled memory usage with max pool sizes
+```csharp
+var toast = ObjectPooler.Spawn("Toast", toastPrefab, canvasTransform);
+```
 
-## Troubleshooting
+## IPooledObject
 
-**Issue**: Objects not appearing
+```csharp
+public interface IPooledObject
+{
+    void OnSpawn();   // after the instance is placed and activated
+    void OnDespawn(); // before it is deactivated
+}
+```
 
-- Verify the prefab is assigned and the pool name matches
-- Check `OnSpawn()` isn't deactivating or moving the object off-screen
+Every `IPooledObject` on the prefab's **root** GameObject is called, in component order. Components
+on children, or added at runtime, are not called. An exception in one callback is logged and the
+others still run.
 
-**Issue**: Pool growing unbounded
+## Drop-ins (`Runtime/Components`)
 
-- Set an appropriate `maxSize`
-- Make sure every spawn has a matching `Release`
+Add one to a prefab; spawn it as usual and it despawns itself.
 
-**Issue**: Objects behaving incorrectly on reuse
+| Drop-in | Despawns the instance when |
+| --- | --- |
+| `DespawnAfterDelay` | `Delay` seconds have passed since spawn (`_useUnscaledTime` ignores `Time.timeScale`) |
+| `DespawnWhenParticlesFinish` | the `ParticleSystem` and all its children have finished (looping systems never finish) |
 
-- Reset all mutable state in `OnDespawn()` / `OnSpawn()`
-- Physics: zero out velocity and angular velocity
+## Events
 
-**Issue**: "Cleaned up N destroyed objects from tracking" warning
+```csharp
+public static event Action<PoolEventArgs> Spawned;    // after every OnSpawn
+public static event Action<PoolEventArgs> Despawned;  // after every OnDespawn, before deactivation
 
-- Something called `Destroy()` on a pooled object. Use `ObjectPooler.Release` or
-  `ObjectPooler.DestroyPooledObject` instead.
+public readonly struct PoolEventArgs
+{
+    public readonly string     PoolName;
+    public readonly GameObject Instance;
+}
+```
 
-**Issue**: Event handler fires on a destroyed listener
+- Events are static: subscribe in `OnEnable`, unsubscribe in `OnDisable`.
+- They are reset when entering Play mode, so they are safe with Domain Reload disabled.
+- An exception in a handler is logged and does not break the pool.
+- Handlers run synchronously inside every spawn and despawn; keep them cheap.
 
-- A subscriber forgot to unsubscribe. Pair every `+=` with a `-=`.
+## When callbacks and events run
 
-## License
+| Call | `OnSpawn` + `Spawned` | `OnDespawn` + `Despawned` |
+| --- | --- | --- |
+| `Spawn` | yes | — |
+| `Prewarm` | no | no |
+| `Despawn`, `DespawnAll` | — | yes, for each active instance |
+| `DestroyInstance` | — | yes, if the instance was active |
+| `DestroyPool`, `DestroyAllPools` | — | yes, for each active instance, then everything is destroyed |
+| `ObjectPooler` destroyed (quit, leaving Play mode) | — | no |
 
-This object pooling system is part of your Unity project.
+## API
+
+All members are `static` on `OPS.ObjectPooler`. `initialCapacity` and `maxInactive` apply only when
+the call creates the pool.
+
+```csharp
+GameObject Spawn(string poolName, GameObject prefab, Transform parent = null, int initialCapacity = 10, int maxInactive = 100)
+T          Spawn<T>(string poolName, T prefab, Transform parent = null, int initialCapacity = 10, int maxInactive = 100) where T : Component
+
+void Despawn(GameObject instance)
+void Despawn(Component instance)
+void DespawnAll(string poolName)
+void DespawnAll()
+
+void Prewarm(string poolName, GameObject prefab, int count, int initialCapacity = 10, int maxInactive = 100)
+void Prewarm(string poolName, Component prefab, int count, int initialCapacity = 10, int maxInactive = 100)
+
+void DestroyInstance(GameObject instance)
+void DestroyInstance(Component instance)
+void DestroyPool(string poolName)
+void DestroyAllPools()
+
+int  CountActive(string poolName)
+bool TryGetSnapshot(string poolName, out PoolSnapshot snapshot)
+void GetAllSnapshots(List<PoolSnapshot> results)   // clears, then fills; no allocation
+```
+
+- `initialCapacity` reserves storage only; it does not create instances. Use `Prewarm` for that.
+- `maxInactive` caps how many inactive instances a pool keeps. A despawn beyond it destroys the
+  instance. The number of active instances is not capped.
+- `Prewarm` creates inactive instances until the pool holds `count`, capped at `maxInactive`. The
+  instances' `Awake` runs on their first spawn, not during prewarm.
+- `Spawn` with a prefab other than the one the pool was created with logs an error once and spawns
+  from the existing pool. `Spawn<T>` throws `InvalidOperationException` if that prefab has no `T`.
+- `Despawn` of an object no pool spawned, or one already despawned, logs a warning.
+- `PoolSnapshot` has `Name`, `Active`, `Inactive`, `SpawnCount`, `DespawnCount`, `PeakActive`,
+  `InitialCapacity` and `MaxInactive`. In the Editor, the `ObjectPooler` Inspector shows them live.
+
+### Logging
+
+```csharp
+PoolLogger.LogLevel = PoolLogLevel.None;   // None | Errors | Warnings (default) | All
+```
+
+## Rules
+
+- Never `Destroy()` a spawned instance; use `Despawn` or `DestroyInstance`.
+- Reset per-spawn state in `OnSpawn` / `OnDespawn`.
+- Don't call `Despawn` from an instance's own `OnDisable` / `OnDestroy`: while its hierarchy is being
+  torn down Unity rejects the reparent.
+- Don't reparent an instance inside `OnDespawn` or a `Despawned` handler; the pool reparents it
+  right after.
+
+## Migrating from 1.x
+
+| 1.x | Now |
+| --- | --- |
+| `Release(obj)` | `Despawn(obj)` |
+| `ReleaseAllPool(name)` | `DespawnAll(name)` |
+| `ReleaseAllPools()` | `DespawnAll()` |
+| `ClearPool(name)`, `ReleaseAndClearPool(name)` | `DestroyPool(name)` (always despawns first) |
+| `ClearAllPools()` | `DestroyAllPools()` |
+| `DestroyPooledObject(obj)` | `DestroyInstance(obj)` (now runs `OnDespawn` if active) |
+| `CreatePool(name, prefab).WithCapacity(c).WithMaxSize(m).WithPrewarm(n).Prewarm()` | `Prewarm(name, prefab, n, c, m)` |
+| `CreatePool(...).BuildAndGet()` | `Prewarm(...)` then `Spawn(...)` |
+| `defaultCapacity`, `maxSize` parameters | `initialCapacity`, `maxInactive` |
+| `GetActiveObjectCount(name)` | `CountActive(name)` |
+| `GetStatistics(name)`, `GetAllStatistics()` | `TryGetSnapshot(name, out s)`, `GetAllSnapshots(list)` |
+| `ValidatePoolIntegrity()`, `RecoverCorruptedPools()` | removed; destroyed instances are dropped automatically |
+| `GetInstance()` | removed |
+| events `OnSpawn` / `OnDespawn` | `Spawned` / `Despawned` |
+| `PoolEventArgs.GameObject`, `PoolEventArgs.PoolKey` | `PoolEventArgs.Instance`; no key, the name is the identity |
+| `PooledReleaseDelay`, `PooledParticle` | `DespawnAfterDelay`, `DespawnWhenParticlesFinish` (same GUIDs, prefabs keep working) |
+
+Behaviour changes:
+
+- Pools are keyed by name only: `Spawn<Bullet>("fx", …)` and `Spawn("fx", go)` now share one pool.
+- Pools survive scene loads; previously their inactive instances were destroyed with the scene and
+  the next `Spawn` threw `MissingReferenceException`.
+- Every `IPooledObject` on the root is called, for both `Spawn` and `Spawn<T>`.
+- `Spawn` restores the prefab's local transform; despawn no longer forces zero/identity/one.
+- `Spawn` with a parent reparents before activation, so `OnEnable` and `OnSpawn` see the final parent.
+- `Prewarm` no longer runs callbacks or events.

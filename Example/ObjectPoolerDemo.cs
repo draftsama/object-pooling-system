@@ -38,14 +38,14 @@ public class ObjectPoolerDemo : MonoBehaviour
         // Clear all pools with C key
         if (Keyboard.current.cKey.wasPressedThisFrame)
         {
-            ObjectPooler.ClearAllPools();
-            Debug.Log("All pools cleared!");
+            ObjectPooler.DestroyAllPools();
+            Debug.Log("All pools destroyed!");
         }
         
         if (Keyboard.current.rKey.wasPressedThisFrame)
         {
-            ObjectPooler.ReleaseAndClearPool(poolName);
-            Debug.Log($"All objects in pool {poolName} released!");
+            ObjectPooler.DestroyPool(poolName);
+            Debug.Log($"Pool {poolName} destroyed!");
         }
     }
 
