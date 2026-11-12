@@ -29,8 +29,8 @@ namespace OPS
 
         /// <summary>
         /// Raised after <see cref="IPooledObject.OnDespawn"/> ran and before the instance is deactivated
-        /// and its transform reset, so its final position and parent are still readable.
-        /// Not raised by <see cref="DestroyInstance(GameObject)"/>.
+        /// and moved back into its pool, so its final position and parent are still readable.
+        /// Also raised by <see cref="DestroyInstance(GameObject)"/> and <see cref="DestroyPool"/> for active instances.
         /// </summary>
         public static event Action<PoolEventArgs> Despawned;
 
