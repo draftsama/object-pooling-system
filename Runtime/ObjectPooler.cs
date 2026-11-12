@@ -1,243 +1,273 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace OPS
 {
-    [System.Serializable]
-    public class PoolInfo
-    {
-        public string poolName;
-        public int activeCount;
-        public int inactiveCount;
-        public int totalCount;
-        public int capacity;
-        public int maxSize;
-    }
-
     /// <summary>
-    /// Payload for <see cref="ObjectPooler.OnSpawn"/> and <see cref="ObjectPooler.OnDespawn"/>.
+    /// Static entry point for every pool. The first Spawn or Prewarm in Play mode creates a
+    /// DontDestroyOnLoad "ObjectPooler" GameObject that keeps every pool and its inactive instances,
+    /// so pools survive scene loads. Active instances live in the scene they were spawned into.
+    /// Pools are identified by name only.
     /// </summary>
-    public readonly struct PoolEventArgs
+    public sealed class ObjectPooler : MonoBehaviour
     {
-        /// <summary>Name passed to Spawn/CreatePool, without the type prefix.</summary>
-        public readonly string PoolName;
+        public const int DefaultInitialCapacity = 10;
+        public const int DefaultMaxInactive = 100;
 
-        /// <summary>Type-qualified internal key, e.g. "Bullet::enemy_bullets". Unique per pool.</summary>
-        public readonly string PoolKey;
-
-        /// <summary>The spawned/despawned instance.</summary>
-        public readonly GameObject GameObject;
-
-        public PoolEventArgs(string poolName, string poolKey, GameObject gameObject)
-        {
-            PoolName = poolName;
-            PoolKey = poolKey;
-            GameObject = gameObject;
-        }
-
-        public override string ToString() => $"{PoolKey} -> {(GameObject != null ? GameObject.name : "<destroyed>")}";
-    }
-
-    /// <summary>
-    /// Singleton facade for the ObjectPooling system. Delegates all state and logic to PoolRegistry.
-    /// </summary>
-    public class ObjectPooler : MonoBehaviour
-    {
-        private static ObjectPooler instance;
+        private static ObjectPooler _instance;
+        private static bool _quitting;
         private PoolRegistry _registry;
 
-        // ========== Global spawn/despawn events ==========
+        /// <summary>
+        /// Raised after an instance is activated and its <see cref="IPooledObject.OnSpawn"/> callbacks ran.
+        /// Not raised by <see cref="Prewarm(string, GameObject, int, int, int)"/>.
+        /// Static: unsubscribe in OnDisable/OnDestroy.
+        /// </summary>
+        public static event Action<PoolEventArgs> Spawned;
 
         /// <summary>
-        /// Raised after an object is taken from a pool and its <see cref="IPooledObject.OnSpawn"/> ran.
-        /// Static: subscribers MUST unsubscribe in OnDisable/OnDestroy or they leak across scenes.
+        /// Raised after <see cref="IPooledObject.OnDespawn"/> ran and before the instance is deactivated
+        /// and its transform reset, so its final position and parent are still readable.
+        /// Not raised by <see cref="DestroyInstance(GameObject)"/>.
         /// </summary>
-        public static event Action<PoolEventArgs> OnSpawn;
+        public static event Action<PoolEventArgs> Despawned;
 
-        /// <summary>
-        /// Raised when an object is returned to its pool, after <see cref="IPooledObject.OnDespawn"/>
-        /// and before the object is deactivated and its transform reset — so subscribers can still
-        /// read its final position/parent.
-        /// Not raised for objects destroyed via DestroyPooledObject, ClearPool or ClearAllPools.
-        /// </summary>
-        public static event Action<PoolEventArgs> OnDespawn;
-
-        internal static void RaiseSpawn(PoolEventArgs args)
+        private static void RaiseSpawned(PoolEventArgs args)
         {
-            var handler = OnSpawn;
+            Action<PoolEventArgs> handler = Spawned;
             if (handler == null) return;
             try { handler(args); }
-            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.OnSpawn subscriber threw for {args}: {e}"); }
+            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.Spawned subscriber threw for {args}: {e}"); }
         }
 
-        internal static void RaiseDespawn(PoolEventArgs args)
+        private static void RaiseDespawned(PoolEventArgs args)
         {
-            var handler = OnDespawn;
+            Action<PoolEventArgs> handler = Despawned;
             if (handler == null) return;
             try { handler(args); }
-            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.OnDespawn subscriber threw for {args}: {e}"); }
+            catch (Exception e) { PoolLogger.LogError($"ObjectPooler.Despawned subscriber threw for {args}: {e}"); }
         }
 
-        /// <summary>
-        /// Clears static state so stale subscribers from a previous play session cannot survive
-        /// when Domain Reload is disabled (Enter Play Mode Options).
-        /// </summary>
+        // Domain Reload can be disabled (Enter Play Mode Options), so statics must be reset by hand.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         private static void ResetStatics()
         {
-            OnSpawn = null;
-            OnDespawn = null;
-            instance = null;
+            Spawned = null;
+            Despawned = null;
+            _instance = null;
+            _quitting = false;
+            Application.quitting -= OnQuitting;
+            Application.quitting += OnQuitting;
         }
 
-        [Header("Pool Information")]
-        [SerializeField] private List<PoolInfo> poolInfoList = new List<PoolInfo>();
+        private static void OnQuitting() => _quitting = true;
 
-        [Header("Statistics")]
-        [SerializeField] private int totalPools;
-        [SerializeField] private int totalActiveObjects;
-        [SerializeField] private int totalInactiveObjects;
-
-        private readonly WaitForSeconds _integrityWait = new WaitForSeconds(10f);
-
-#if UNITY_EDITOR
-        private readonly WaitForSeconds _updateWait = new WaitForSeconds(0.5f);
-
-        private IEnumerator UpdatePoolInfoRoutine()
+        private static PoolRegistry GetOrCreateRegistry()
         {
-            while (true)
+            if (_instance == null)
             {
-                _registry.PopulatePoolInfo(poolInfoList, out totalPools, out totalActiveObjects, out totalInactiveObjects);
-                yield return _updateWait;
+                if (_quitting) throw new InvalidOperationException("ObjectPooler cannot create pools while the application is quitting.");
+                if (!Application.isPlaying) throw new InvalidOperationException("ObjectPooler works only in Play mode.");
+                _instance = new GameObject(nameof(ObjectPooler)).AddComponent<ObjectPooler>();
             }
-        }
-#endif
-
-        private IEnumerator IntegrityCheckRoutine()
-        {
-            yield return _integrityWait;
-            while (true)
-            {
-                _registry.ValidatePoolIntegrityInternal();
-                yield return _integrityWait;
-            }
+            return _instance._registry;
         }
 
-        public static ObjectPooler GetInstance()
+        private static bool TryGetRegistry(out PoolRegistry registry)
         {
-            if (instance == null)
-            {
-                instance = new GameObject("ObjectPooler").AddComponent<ObjectPooler>();
-            }
-            return instance;
+            registry = _instance != null ? _instance._registry : null;
+            return registry != null;
         }
 
         private void Awake()
         {
-            if (instance != null && instance != this)
+            if (_instance != null && _instance != this)
             {
                 Destroy(gameObject);
                 return;
             }
 
-            instance = this;
-            _registry = new PoolRegistry();
+            _instance = this;
+            _registry = new PoolRegistry(transform, RaiseSpawned, RaiseDespawned);
             DontDestroyOnLoad(gameObject);
-#if UNITY_EDITOR
-            StartCoroutine(UpdatePoolInfoRoutine());
-#endif
-            StartCoroutine(IntegrityCheckRoutine());
         }
+
+        private void OnEnable() => SceneManager.sceneUnloaded += OnSceneUnloaded;
+
+        private void OnDisable() => SceneManager.sceneUnloaded -= OnSceneUnloaded;
+
+        private void OnSceneUnloaded(Scene scene) => _registry?.PruneDestroyed();
 
         private void OnDestroy()
         {
-            if (instance == this)
-            {
-                StopAllCoroutines();
-                _registry?.ClearAll();
-                instance = null;
-            }
+            if (_instance != this) return;
+            _registry?.Forget();
+            _instance = null;
         }
 
-        // ========== Builder factory methods (D-03) ==========
+        // ========== Spawn / Despawn ==========
 
-        public static PoolBuilder<T> CreatePool<T>(string poolName, T prefab) where T : Component
-            => new PoolBuilder<T>(poolName, prefab);
+        /// <summary>
+        /// Takes an instance from the pool named <paramref name="poolName"/>, creating the pool on first use.
+        /// The instance is placed at the prefab's local position, rotation and scale under
+        /// <paramref name="parent"/> (or at the root of the active scene) before it is activated.
+        /// <paramref name="initialCapacity"/> and <paramref name="maxInactive"/> apply only when the pool is created.
+        /// A later call with a different prefab logs an error once and spawns from the existing pool.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Outside Play mode, or while the application is quitting.</exception>
+        public static GameObject Spawn(string poolName, GameObject prefab, Transform parent = null,
+            int initialCapacity = DefaultInitialCapacity, int maxInactive = DefaultMaxInactive)
+            => GetOrCreateRegistry().Spawn(poolName, prefab, parent, initialCapacity, maxInactive);
 
-        public static GameObjectPoolBuilder CreatePool(string poolName, GameObject prefab)
-            => new GameObjectPoolBuilder(poolName, prefab);
+        /// <inheritdoc cref="Spawn(string, GameObject, Transform, int, int)"/>
+        /// <exception cref="InvalidOperationException">The pool's prefab has no <typeparamref name="T"/>.</exception>
+        public static T Spawn<T>(string poolName, T prefab, Transform parent = null,
+            int initialCapacity = DefaultInitialCapacity, int maxInactive = DefaultMaxInactive) where T : Component
+            => GetOrCreateRegistry().Spawn(poolName, prefab, parent, initialCapacity, maxInactive);
 
-        // ========== Spawn / Release API (D-01, D-02) ==========
+        public static GameObject Spawn(string poolName, GameObject prefab, int initialCapacity, int maxInactive = DefaultMaxInactive)
+            => Spawn(poolName, prefab, null, initialCapacity, maxInactive);
 
-        public static T Spawn<T>(string poolName, T prefab, int defaultCapacity = 10, int maxSize = 100) where T : Component
-            => GetInstance()._registry.GetFromPool(poolName, prefab, defaultCapacity, maxSize);
+        public static T Spawn<T>(string poolName, T prefab, int initialCapacity, int maxInactive = DefaultMaxInactive) where T : Component
+            => Spawn(poolName, prefab, null, initialCapacity, maxInactive);
 
-        public static GameObject Spawn(string poolName, GameObject prefab, int defaultCapacity = 10, int maxSize = 100)
-            => GetInstance()._registry.GetFromPoolGameObject(poolName, prefab, defaultCapacity, maxSize);
-
-        /// <summary>Spawn and parent under <paramref name="parent"/> (e.g. a Canvas) — required for UI prefabs.</summary>
-        public static T Spawn<T>(string poolName, T prefab, Transform parent, int defaultCapacity = 10, int maxSize = 100) where T : Component
+        /// <summary>
+        /// Returns an instance to its pool. Logs a warning for an object no pool spawned or one already despawned.
+        /// Beyond the pool's max inactive count the instance is destroyed instead.
+        /// Don't call it from the instance's OnDisable/OnDestroy: during hierarchy teardown Unity rejects the reparent.
+        /// </summary>
+        public static void Despawn(GameObject instance)
         {
-            T obj = Spawn(poolName, prefab, defaultCapacity, maxSize);
-            obj.transform.SetParent(parent, false);
-            return obj;
+            if (TryGetRegistry(out PoolRegistry registry)) registry.Despawn(instance);
         }
 
-        public static GameObject Spawn(string poolName, GameObject prefab, Transform parent, int defaultCapacity = 10, int maxSize = 100)
+        /// <inheritdoc cref="Despawn(GameObject)"/>
+        public static void Despawn(Component instance)
         {
-            GameObject obj = Spawn(poolName, prefab, defaultCapacity, maxSize);
-            obj.transform.SetParent(parent, false);
-            return obj;
+            if (instance != null) Despawn(instance.gameObject);
         }
 
-        public static void Release<T>(T obj) where T : Component
-            => GetInstance()._registry.ReturnToPool(obj.gameObject);
+        /// <summary>Despawns every active instance of one pool.</summary>
+        public static void DespawnAll(string poolName)
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.DespawnAll(poolName);
+        }
 
-        public static void Release(GameObject obj)
-            => GetInstance()._registry.ReturnToPool(obj);
+        /// <summary>Despawns every active instance of every pool.</summary>
+        public static void DespawnAll()
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.DespawnAll();
+        }
+
+        // ========== Prewarm ==========
+
+        /// <summary>
+        /// Creates inactive instances until the pool holds <paramref name="count"/> of them (capped at max inactive).
+        /// No <see cref="IPooledObject"/> callbacks or events run.
+        /// </summary>
+        public static void Prewarm(string poolName, GameObject prefab, int count,
+            int initialCapacity = DefaultInitialCapacity, int maxInactive = DefaultMaxInactive)
+            => GetOrCreateRegistry().Prewarm(poolName, prefab, count, initialCapacity, maxInactive);
+
+        /// <inheritdoc cref="Prewarm(string, GameObject, int, int, int)"/>
+        public static void Prewarm(string poolName, Component prefab, int count,
+            int initialCapacity = DefaultInitialCapacity, int maxInactive = DefaultMaxInactive)
+        {
+            if (prefab == null) throw new ArgumentNullException(nameof(prefab));
+            Prewarm(poolName, prefab.gameObject, count, initialCapacity, maxInactive);
+        }
 
         // ========== Destroy ==========
 
-        public static void DestroyPooledObject<T>(T obj) where T : Component
-            => GetInstance()._registry.DestroyAndRemoveFromPool(obj.gameObject);
+        /// <summary>
+        /// Destroys one instance and removes it from its pool. An active instance runs its
+        /// <see cref="IPooledObject.OnDespawn"/> callbacks and raises <see cref="Despawned"/> first.
+        /// Destroys a non-pooled object as <c>Object.Destroy</c> would.
+        /// </summary>
+        public static void DestroyInstance(GameObject instance)
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.DestroyInstance(instance);
+            else if (instance != null) Destroy(instance);
+        }
 
-        public static void DestroyPooledObject(GameObject obj)
-            => GetInstance()._registry.DestroyAndRemoveFromPool(obj);
+        /// <inheritdoc cref="DestroyInstance(GameObject)"/>
+        public static void DestroyInstance(Component instance)
+        {
+            if (instance != null) DestroyInstance(instance.gameObject);
+        }
 
-        // ========== Release / Clear API (D-12: no bool-flag overloads) ==========
+        /// <summary>Despawns every active instance of the pool (events fire), then destroys the pool and all its instances.</summary>
+        public static void DestroyPool(string poolName)
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.DestroyPool(poolName);
+        }
 
-        public static void ReleaseAllPool(string poolName)
-            => GetInstance()._registry.ReleaseAllFromPool(poolName);
+        /// <summary><see cref="DestroyPool"/> for every pool.</summary>
+        public static void DestroyAllPools()
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.DestroyAllPools();
+        }
 
-        public static void ReleaseAndClearPool(string poolName)
-            => GetInstance()._registry.ReleaseAndClearFromPool(poolName);
+        // ========== Queries ==========
 
-        public static void ReleaseAllPools()
-            => GetInstance()._registry.ReleaseAllFromAllPools();
+        public static int CountActive(string poolName)
+            => TryGetRegistry(out PoolRegistry registry) ? registry.CountActive(poolName) : 0;
 
-        public static void ClearPool(string poolName)
-            => GetInstance()._registry.ClearSpecificPool(poolName);
+        public static bool TryGetSnapshot(string poolName, out PoolSnapshot snapshot)
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) return registry.TryGetSnapshot(poolName, out snapshot);
+            snapshot = default;
+            return false;
+        }
 
-        public static void ClearAllPools()
-            => GetInstance()._registry.ClearAll();
+        /// <summary>Clears <paramref name="results"/> and fills it with one snapshot per pool.</summary>
+        public static void GetAllSnapshots(List<PoolSnapshot> results)
+        {
+            if (TryGetRegistry(out PoolRegistry registry)) registry.GetAllSnapshots(results);
+            else results.Clear();
+        }
 
-        // ========== Statistics & integrity ==========
+#if UNITY_EDITOR
+        [Serializable]
+        private sealed class InspectorRow
+        {
+            public string name;
+            public int active;
+            public int inactive;
+            public int peakActive;
+            public int spawnCount;
+            public int despawnCount;
+            public int maxInactive;
+        }
 
-        public static PoolStatistics GetStatistics(string poolName)
-            => GetInstance()._registry.GetStatisticsInternal(poolName);
+        [SerializeField] private List<InspectorRow> _pools = new List<InspectorRow>();
+        private readonly List<PoolSnapshot> _snapshots = new List<PoolSnapshot>();
+        private float _nextInspectorRefresh;
 
-        public static Dictionary<string, PoolStatistics> GetAllStatistics()
-            => GetInstance()._registry.GetAllStatisticsInternal();
+        private void Update()
+        {
+            if (Time.unscaledTime < _nextInspectorRefresh) return;
+            _nextInspectorRefresh = Time.unscaledTime + 0.5f;
 
-        public static int GetActiveObjectCount(string poolName)
-            => GetInstance()._registry.GetActiveObjectCountInternal(poolName);
+            _registry.GetAllSnapshots(_snapshots);
+            while (_pools.Count < _snapshots.Count) _pools.Add(new InspectorRow());
+            if (_pools.Count > _snapshots.Count) _pools.RemoveRange(_snapshots.Count, _pools.Count - _snapshots.Count);
 
-        public static int ValidatePoolIntegrity()
-            => GetInstance()._registry.ValidatePoolIntegrityInternal();
-
-        public static void RecoverCorruptedPools()
-            => GetInstance()._registry.RecoverCorruptedPoolsInternal();
+            for (int i = 0; i < _snapshots.Count; i++)
+            {
+                PoolSnapshot s = _snapshots[i];
+                InspectorRow row = _pools[i];
+                row.name = s.Name;
+                row.active = s.Active;
+                row.inactive = s.Inactive;
+                row.peakActive = s.PeakActive;
+                row.spawnCount = s.SpawnCount;
+                row.despawnCount = s.DespawnCount;
+                row.maxInactive = s.MaxInactive;
+            }
+        }
+#endif
     }
 }

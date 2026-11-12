@@ -4,7 +4,7 @@ namespace OPS
 {
     [DisallowMultipleComponent]
     [RequireComponent(typeof(ParticleSystem))]
-    public class PooledParticle : MonoBehaviour, IPooledObject
+    public class DespawnWhenParticlesFinish : MonoBehaviour, IPooledObject
     {
         private ParticleSystem _particleSystem;
         private bool _isPlaying;
@@ -35,7 +35,7 @@ namespace OPS
             if (_particleSystem.IsAlive(true)) return;
 
             _isPlaying = false;
-            ObjectPooler.Release(gameObject);
+            ObjectPooler.Despawn(gameObject);
         }
     }
 }

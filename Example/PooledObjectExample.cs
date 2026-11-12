@@ -48,7 +48,7 @@ namespace OPS.Demo
             // Auto-release after lifetime expires
             if (Time.time - spawnTime >= lifetime)
             {
-                ObjectPooler.Release(this);
+                ObjectPooler.Despawn(this);
             }
         }
     }
